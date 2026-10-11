@@ -131,6 +131,22 @@ def ensure_schema(conn):
             note        TEXT,
             created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
         );
+
+        CREATE TABLE IF NOT EXISTS ingestion_run_log (
+            id               UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            run_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+            mode             TEXT NOT NULL,
+            triggered_by     TEXT NOT NULL DEFAULT 'cli',
+            source_files     JSONB NOT NULL DEFAULT '[]',
+            vertices_added   INTEGER NOT NULL DEFAULT 0,
+            edges_added      INTEGER NOT NULL DEFAULT 0,
+            chunks_added     INTEGER NOT NULL DEFAULT 0,
+            duration_sec     NUMERIC(8,2),
+            status           TEXT NOT NULL DEFAULT 'success',
+            error_detail     TEXT,
+            graph_json_hash  TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_irl_run_at ON ingestion_run_log (run_at DESC);
     """)
     conn.commit()
     cur.close()
@@ -217,6 +233,12 @@ def ingest_yaml(conn, yaml_path):
 
     yaml_hash = hashlib.sha256(open(yaml_path, "rb").read()).hexdigest()[:16]
     cur = conn.cursor()
+
+    # Count rows before so we can report delta
+    cur.execute("SELECT COUNT(*) AS n FROM graph_vertices")
+    v_before = cur.fetchone()["n"]
+    cur.execute("SELECT COUNT(*) AS n FROM graph_edges")
+    e_before = cur.fetchone()["n"]
 
     vehicle = data["vehicle"]
     v_uuid = upsert_vertex(cur, "Vehicle", {
@@ -322,9 +344,20 @@ def ingest_yaml(conn, yaml_path):
         (yaml_hash, f"Ingested from {yaml_path}")
     )
     conn.commit()
+
+    # Compute deltas
+    cur.execute("SELECT COUNT(*) AS n FROM graph_vertices")
+    v_after = cur.fetchone()["n"]
+    cur.execute("SELECT COUNT(*) AS n FROM graph_edges")
+    e_after = cur.fetchone()["n"]
     cur.close()
+
+    vertices_added = v_after - v_before
+    edges_added    = e_after - e_before
     print(f"\nGraph ingestion complete. YAML hash: {yaml_hash}")
+    print(f"  +{vertices_added} vertices, +{edges_added} edges")
     write_json_graph(conn)
+    return vertices_added, edges_added
 
 def write_json_graph(conn):
     """Write full graph to local JSON — the interim graph layer for queries."""
@@ -410,6 +443,8 @@ def ingest_documents(conn, docs_folder):
 
     print(f"Found {len(files)} file(s) to ingest\n")
     cur = conn.cursor()
+    total_chunks = 0
+    ingested_files = []
 
     for file_path in files:
         print(f"Processing: {file_path.name}")
@@ -449,9 +484,12 @@ def ingest_documents(conn, docs_folder):
 
         conn.commit()
         print(f"  Stored {len(chunks)} chunks\n")
+        total_chunks += len(chunks)
+        ingested_files.append(file_path.name)
 
     cur.close()
     print("Document ingestion complete.")
+    return total_chunks, ingested_files
 
 # ── LOCAL JSON GRAPH QUERIES (no graph DB needed) ─────────────────────────────
 
@@ -679,11 +717,60 @@ def interactive_query(conn):
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 
+def write_run_log(conn, mode, triggered_by, source_files,
+                  vertices_added, edges_added, chunks_added,
+                  duration_sec, status, error_detail=None):
+    """Write one row to ingestion_run_log so every run is auditable."""
+    graph_json_hash = None
+    if Path(GRAPH_JSON).exists():
+        graph_json_hash = hashlib.sha256(
+            open(GRAPH_JSON, "rb").read()
+        ).hexdigest()[:16]
+
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO ingestion_run_log
+            (mode, triggered_by, source_files,
+             vertices_added, edges_added, chunks_added,
+             duration_sec, status, error_detail, graph_json_hash)
+        VALUES (%s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING id, run_at
+    """, (
+        mode,
+        triggered_by,
+        json.dumps(source_files),
+        vertices_added,
+        edges_added,
+        chunks_added,
+        duration_sec,
+        status,
+        error_detail,
+        graph_json_hash,
+    ))
+    row = cur.fetchone()
+    conn.commit()
+    cur.close()
+    run_id = str(row["id"])
+    run_at = row["run_at"]
+    print(f"\n── Ingestion run recorded ──────────────────────────────────")
+    print(f"  Run ID   : {run_id}")
+    print(f"  Timestamp: {run_at}")
+    print(f"  Mode     : {mode}")
+    print(f"  Status   : {status}")
+    print(f"  Vertices : +{vertices_added}   Edges: +{edges_added}   Chunks: +{chunks_added}")
+    print(f"  Duration : {duration_sec:.1f}s")
+    if graph_json_hash:
+        print(f"  Graph SHA: {graph_json_hash}")
+    print(f"────────────────────────────────────────────────────────────")
+
+
 def main():
     parser = argparse.ArgumentParser(description="ESAM standalone ingestion")
     parser.add_argument("--mode",
         choices=["graph", "docs", "both", "query", "summary"],
         default="both")
+    parser.add_argument("--triggered-by", default="cli",
+        help="Name or identifier of who/what triggered this run (default: cli)")
     args = parser.parse_args()
 
     print(f"\nESAM Standalone Ingestion — mode: {args.mode}")
@@ -692,26 +779,68 @@ def main():
     conn = get_db()
     ensure_schema(conn)
 
-    if args.mode in ("graph", "both"):
-        if not Path(YAML_PATH).exists():
-            print(f"YAML not found: {YAML_PATH}")
-            print("Set YAML_PATH or place vehicle_decomposition.yaml in the current directory.")
-            sys.exit(1)
-        print(f"── Ingesting graph from: {YAML_PATH}")
-        ingest_yaml(conn, YAML_PATH)
+    # query and summary modes don't write data — skip run logging
+    if args.mode in ("query", "summary"):
+        if args.mode == "query":
+            interactive_query(conn)
+        else:
+            graph = load_graph()
+            print_graph_summary(graph)
+        conn.close()
+        print("\nDone.")
+        return
 
-    if args.mode in ("docs", "both"):
-        print(f"\n── Ingesting documents from: {DOCS_FOLDER}/")
-        ingest_documents(conn, DOCS_FOLDER)
+    # Ingestion modes — track everything for the run log
+    import time
+    t_start = time.time()
+    status        = "success"
+    error_detail  = None
+    vertices_added = 0
+    edges_added    = 0
+    chunks_added   = 0
+    source_files   = []
 
-    if args.mode == "query":
-        interactive_query(conn)
+    try:
+        if args.mode in ("graph", "both"):
+            if not Path(YAML_PATH).exists():
+                print(f"YAML not found: {YAML_PATH}")
+                print("Set YAML_PATH or place vehicle_decomposition.yaml in the current directory.")
+                sys.exit(1)
+            print(f"── Ingesting graph from: {YAML_PATH}")
+            va, ea = ingest_yaml(conn, YAML_PATH)
+            vertices_added += va
+            edges_added    += ea
+            source_files.append(str(YAML_PATH))
 
-    if args.mode == "summary":
-        graph = load_graph()
-        print_graph_summary(graph)
+        if args.mode in ("docs", "both"):
+            print(f"\n── Ingesting documents from: {DOCS_FOLDER}/")
+            ca, doc_files = ingest_documents(conn, DOCS_FOLDER)
+            chunks_added += ca
+            source_files.extend(doc_files)
+
+    except Exception as exc:
+        status       = "failed"
+        error_detail = str(exc)
+        print(f"\nERROR during ingestion: {exc}")
+
+    duration_sec = round(time.time() - t_start, 2)
+
+    write_run_log(
+        conn,
+        mode           = args.mode,
+        triggered_by   = args.triggered_by,
+        source_files   = source_files,
+        vertices_added = vertices_added,
+        edges_added    = edges_added,
+        chunks_added   = chunks_added,
+        duration_sec   = duration_sec,
+        status         = status,
+        error_detail   = error_detail,
+    )
 
     conn.close()
+    if status == "failed":
+        sys.exit(1)
     print("\nDone.")
 
 if __name__ == "__main__":
